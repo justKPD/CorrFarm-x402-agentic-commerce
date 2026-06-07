@@ -79,23 +79,55 @@ export const REVERSE_SYMBOL_MAP: Record<string, string> = Object.fromEntries(
 // Helpers
 // ---------------------------------------------------------------------------
 
-const BASE_URL = 'https://api.binance.com';
+/**
+ * Binance market-data hosts, tried in order.
+ * `data-api.binance.vision` is Binance's PUBLIC market-data mirror and is NOT
+ * geo-restricted (the main api.binance.com returns HTTP 451 from many server
+ * regions, e.g. Netlify/AWS). We try the unrestricted mirror first, then fall
+ * back to the regional API hosts so a single blocked host never breaks a run.
+ */
+const BINANCE_HOSTS = [
+  'https://data-api.binance.vision',
+  'https://api.binance.com',
+  'https://api-gcp.binance.com',
+  'https://api1.binance.com',
+  'https://api2.binance.com',
+];
+
+// HTTP statuses that mean "this host won't serve us — try the next one".
+const HOST_RETRY_STATUS = new Set([403, 418, 429, 451]);
 
 async function fetchBinance<T>(endpoint: string, params: Record<string, string> = {}): Promise<T> {
   const qs = new URLSearchParams(params).toString();
-  const url = `${BASE_URL}${endpoint}${qs ? `?${qs}` : ''}`;
+  let lastErr: Error | null = null;
 
-  const res = await fetch(url, {
-    headers: { 'Accept': 'application/json' },
-    next: { revalidate: 60 }, // cache 60 s
-  });
+  for (const host of BINANCE_HOSTS) {
+    const url = `${host}${endpoint}${qs ? `?${qs}` : ''}`;
+    try {
+      const res = await fetch(url, {
+        headers: { 'Accept': 'application/json' },
+        next: { revalidate: 60 }, // cache 60 s
+      });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Binance API error ${res.status}: ${body}`);
+      if (res.ok) {
+        return (await res.json()) as T;
+      }
+
+      // Geo-block / rate-limit on this host → try the next one.
+      if (HOST_RETRY_STATUS.has(res.status)) {
+        lastErr = new Error(`Binance host ${host} returned ${res.status}`);
+        continue;
+      }
+
+      const body = await res.text().catch(() => '');
+      throw new Error(`Binance API error ${res.status}: ${body}`);
+    } catch (err) {
+      // Network error or thrown above for retry-able status → try next host.
+      lastErr = err instanceof Error ? err : new Error(String(err));
+    }
   }
 
-  return res.json() as Promise<T>;
+  throw lastErr ?? new Error('Binance: all hosts failed');
 }
 
 /** Convert a friendly name or a raw symbol to the Binance symbol. */
@@ -344,18 +376,14 @@ export async function getExtendedPriceHistory(
       params.endTime = String(endTime - 1); // Go further back
     }
 
-    const qs = new URLSearchParams(params).toString();
-    const url = `${BASE_URL}/api/v3/klines?${qs}`;
-
-    const res = await fetch(url, {
-      headers: { 'Accept': 'application/json' },
-      next: { revalidate: 3600 }, // Cache 1h for historical data
-    });
-
-    if (!res.ok) break;
-
-    const data = (await res.json()) as unknown[][];
-    if (data.length === 0) break;
+    // Use the host-fallback helper so geo-blocked hosts (HTTP 451) don't break us.
+    let data: unknown[][];
+    try {
+      data = await fetchBinance<unknown[][]>('/api/v3/klines', params);
+    } catch {
+      break;
+    }
+    if (!Array.isArray(data) || data.length === 0) break;
 
     const klines: Kline[] = data.map((k) => ({
       openTime: Number(k[0]),
