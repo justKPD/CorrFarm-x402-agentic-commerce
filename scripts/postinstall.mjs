@@ -14,6 +14,11 @@ import { dirname, join } from 'node:path';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const ENV_PATH = join(ROOT, '.env.local');
 
+// Always skip in CI / Netlify / Docker / any non-interactive environment
+if (process.env.CI || process.env.NETLIFY || process.env.VERCEL || !process.stdout.isTTY) {
+  process.exit(0);
+}
+
 if (existsSync(ENV_PATH)) {
   console.log('[setup] .env.local found — run `npm run setup` to change keys.');
   process.exit(0);
